@@ -170,6 +170,25 @@ The web UI is plain Preact + htm with no build step, embedded into the binary
 from `internal/web/ui/`. `docs/design/prototype/` holds the same UI running
 against an in-memory mock API.
 
+### CI and releases
+
+`.github/workflows/ci.yml` runs gofmt, vet, tests and a build on Windows and
+macOS for every push and pull request. Pushing a `v*` tag runs
+`.github/workflows/release.yml`, which builds Windows (amd64, arm64) zips and a
+universal macOS binary, then publishes a GitHub release. Tags with a hyphen
+(`v0.2.0-rc1`) become pre-releases.
+
+The macOS binary is signed with a Developer ID and notarized when these
+repository secrets are set; without them it is only ad-hoc signed:
+
+| Secret | Content |
+|---|---|
+| `MACOS_CERT_P12` | "Developer ID Application" certificate with private key, exported as .p12, base64-encoded |
+| `MACOS_CERT_PASSWORD` | Password of that .p12 |
+| `APPLE_API_KEY_P8` | App Store Connect API key (.p8 file contents) for `notarytool` |
+| `APPLE_API_KEY_ID` | Key ID of that API key |
+| `APPLE_API_ISSUER_ID` | Issuer ID shown on the App Store Connect API keys page |
+
 ## License
 
 [MIT](LICENSE). See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for bundled

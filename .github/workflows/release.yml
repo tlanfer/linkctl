@@ -1,0 +1,161 @@
+name: Release
+
+# Push a tag like v0.1.0 to build, sign and publish a GitHub release.
+# Run manually (Actions → Release → Run workflow) to get the build artifacts
+# without publishing anything.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CGO_ENABLED: "0"
+
+jobs:
+  windows:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: build
+        env:
+          GOOS: windows
+          GOARCH: ${{ matrix.arch }}
+        run: |
+          version=$(git describe --tags --always --dirty)
+          mkdir -p dist
+          go build -trimpath -ldflags "-s -w -H=windowsgui -X main.version=$version" -o linkctl.exe ./cmd/linkctl
+          zip -j "dist/linkctl-windows-${{ matrix.arch }}.zip" linkctl.exe LICENSE THIRD_PARTY_NOTICES.md
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: windows-${{ matrix.arch }}
+          path: dist/*
+
+  macos:
+    runs-on: macos-latest
+    env:
+      # All optional: without them the binary is built and ad-hoc signed only.
+      MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+      MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+      APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+      APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+      APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: build universal binary
+        run: |
+          version=$(git describe --tags --always --dirty)
+          for arch in arm64 amd64; do
+            GOOS=darwin GOARCH=$arch go build -trimpath -ldflags "-s -w -X main.version=$version" -o "linkctl-$arch" ./cmd/linkctl
+          done
+          lipo -create -output linkctl linkctl-arm64 linkctl-amd64
+          lipo -info linkctl
+
+      - name: import signing certificate
+        if: env.MACOS_CERT_P12 != ''
+        run: |
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          keychain_pw=$(openssl rand -hex 24)
+          security create-keychain -p "$keychain_pw" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_pw" "$keychain"
+          echo "$MACOS_CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$keychain" -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign
+          rm "$RUNNER_TEMP/cert.p12"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_pw" "$keychain"
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          identity=$(security find-identity -v -p codesigning "$keychain" | grep "Developer ID Application" | head -1 | awk '{print $2}')
+          if [ -z "$identity" ]; then echo "No 'Developer ID Application' identity in the certificate"; exit 1; fi
+          echo "SIGN_IDENTITY=$identity" >> "$GITHUB_ENV"
+
+      - name: sign
+        run: |
+          # Hardened runtime + secure timestamp are required for notarization.
+          # Without a certificate, fall back to an ad-hoc signature ("-").
+          if [ -n "$SIGN_IDENTITY" ]; then
+            codesign --force --options runtime --timestamp --identifier de.tlanfer.linkctl --sign "$SIGN_IDENTITY" linkctl
+          else
+            echo "::warning::No signing certificate configured; the macOS build is ad-hoc signed only."
+            codesign --force --identifier de.tlanfer.linkctl --sign - linkctl
+          fi
+          codesign --verify --strict --verbose=2 linkctl
+          codesign --display --verbose=2 linkctl
+
+      - name: notarize
+        if: env.SIGN_IDENTITY != '' && env.APPLE_API_KEY_P8 != ''
+        run: |
+          key="$RUNNER_TEMP/AuthKey.p8"
+          echo "$APPLE_API_KEY_P8" > "$key"
+          ditto -c -k linkctl "$RUNNER_TEMP/notarize.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
+            --key "$key" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER_ID" \
+            --wait --timeout 30m --output-format json | tee "$RUNNER_TEMP/notary.json"
+          rm "$key"
+          status=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["status"])' "$RUNNER_TEMP/notary.json")
+          if [ "$status" != "Accepted" ]; then
+            id=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["id"])' "$RUNNER_TEMP/notary.json")
+            echo "Notarization $status. Log:"
+            echo "$APPLE_API_KEY_P8" > "$key"
+            xcrun notarytool log "$id" --key "$key" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER_ID"
+            rm "$key"
+            exit 1
+          fi
+
+      - name: package
+        run: |
+          mkdir -p pkg dist
+          cp linkctl LICENSE THIRD_PARTY_NOTICES.md pkg/
+          # ditto keeps the code signature intact.
+          ditto -c -k pkg dist/linkctl-macos-universal.zip
+
+      - name: clean up keychain
+        if: always() && env.MACOS_CERT_P12 != ''
+        run: security delete-keychain "$RUNNER_TEMP/signing.keychain-db" || true
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: macos-universal
+          path: dist/*
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [windows, macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v6
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: checksums
+        run: cd dist && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
+
+      - name: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes \
+            $([[ "$GITHUB_REF_NAME" == *-* ]] && echo --prerelease)
