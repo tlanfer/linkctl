@@ -39,7 +39,7 @@ jobs:
           go build -trimpath -ldflags "-s -w -H=windowsgui -X main.version=$version" -o linkctl.exe ./cmd/linkctl
           zip -j "dist/linkctl-windows-${{ matrix.arch }}.zip" linkctl.exe LICENSE THIRD_PARTY_NOTICES.md
 
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v6
         with:
           name: windows-${{ matrix.arch }}
           path: dist/*
@@ -132,7 +132,7 @@ jobs:
         if: always() && env.MACOS_CERT_P12 != ''
         run: security delete-keychain "$RUNNER_TEMP/signing.keychain-db" || true
 
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v6
         with:
           name: macos-universal
           path: dist/*
